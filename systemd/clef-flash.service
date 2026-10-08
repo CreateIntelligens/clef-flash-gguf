@@ -1,0 +1,19 @@
+[Unit]
+Description=Cloudflare Clef-Flash Decision API Service
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=david
+WorkingDirectory=/home/david/clef-flash-service
+ExecStartPre=-/usr/bin/docker start clef-flash-gguf-server
+ExecStart=/home/david/clef-flash-service/.venv/bin/python3 /home/david/clef-flash-service/api_server.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

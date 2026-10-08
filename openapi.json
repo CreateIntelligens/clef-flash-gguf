@@ -1,0 +1,359 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Cloudflare Clef-Flash Decision API",
+    "description": "\n# Cloudflare Clef-Flash 決策模型 API (SystemOne 相容規格 - GGUF 加速版)\n\nClef-Flash 是 Cloudflare 基於 Qwen3.5-9B 開發的多模態「決策專用模型」。\n與傳統 LLM 逐字輸出（Autoregressive）不同，Clef-Flash 透過 Joint Schema Head 在**單次 Forward Pass** 中直接對所有問題選項計算機率分佈，無須解析文字或處理格式幻覺。\n\n本服務已升級採用 **Q4_K_M GGUF 量化模型 + llama.cpp 核心引擎**，推論延遲顯著優化降低（降低約 80%~90%），同時保持極高準確度。\n\n---\n\n## 📌 支援的三種題目類型 (Question Types)\n\n1. **`choice`（多選一分類）**：\n   - 用於單選分類任務（如部門派工、工單分類、事件類型判定）。\n   - **必填 `criteria`**：格式為字典 `{\"選項ID\": \"選項描述\"}`。\n   - 回傳：選出的 `choice`、信心度 `confidence` 以及所有選項的 `probabilities` 機率分佈。\n\n2. **`noul`（二分判斷 / 是非題）**：\n   - 用於是非、布林、是否核准判定（True / False）。\n   - 可選填 `criteria`（預設會以 `true`/`false` 判斷）。\n   - 回傳：`noul`（代表判定為 `true` 的機率值，介於 0.0 ~ 1.0）。\n\n3. **`score`（等級評定 / 有序評分）**：\n   - 用於有先後順序的等級、優先級、緊急度評等（如優先級 P0~P3、滿意度 1~5 星）。\n   - **必填 `criteria`**：格式為有序字串列表，索引由低至高排列，如 `[\"低\", \"中\", \"高\", \"緊急\"]`。\n   - 回傳：加權期望分數 `score`、最高機率等級 `confidence` 與各等級機率 `probabilities`。\n\n---\n\n## ⚠️ 實體 Token 限制與分塊機制規範 (Important Limits & Chunking)\n\n- **單次請求實體上限 (Physical Token Limit)**：**4,096 Tokens**。\n  - 後端推論引擎實體批次大小設定為 `-b 4096 -ub 4096`。\n- **伺服器「不會自動分塊」(No Server-Side Auto-Chunking)**：\n  - Clef-Flash 模型架構採用單次前向傳播 (Single Forward Pass) 同步計算所有選項的聯合分佈 (Joint Schema)，伺服器**不會**替客戶端自動切塊。\n  - 單次請求總 Token 數（由 `state` 情境描述 + 所有題目 `instructions` + 各選項 `criteria` 說明加總）若超過 **4,096 Tokens**，底層推論引擎將直接拒絕處理並觸發報錯（HTTP 400/500 `input is too large to process`）。\n- **客戶端分塊建議 (Client Chunking Practice)**：\n  - 若題組龐大、選項眾多（Token 消耗會隨「題目數 × 選項數」倍數放大）或情境文本極長，呼叫端**必須在客戶端實作分塊 (Chunking)** 機制（例如：限制單次請求 ≤ 10 個選項，或按業務維度切分為多次請求發送），並在客戶端聚合結果。\n\n---\n\n## 💡 輸入資料格式 (State)\n`state` 欄位可傳入任何情境描述，支援：\n- 純文字字串（客戶訊息、日誌內容、事件通報）\n- JSON 字典物件（結構化資料，模型會自動序列化讀取）\n",
+    "version": "1.1.0"
+  },
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": [
+          "監控與健康狀態"
+        ],
+        "summary": "健康檢查端點",
+        "operationId": "health_health_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/systemone": {
+      "post": {
+        "tags": [
+          "決策推論 (Decision Inference)"
+        ],
+        "summary": "Clef-Flash 決策推論核心端點 (單次上限 4,096 Tokens，不自動分塊)",
+        "description": "接收情境描述 (`state`) 與題組定義 (`questions`)，執行單次 Forward Pass 決策並回傳所有題目的機率分佈與結果。\n\n### ⚠️ 重要限制與整合規範 (Important Constraints & Best Practices)：\n1. **單次請求實體上限 4,096 Tokens**：\n   - 總 Token 計算方式為：`state` 文本 + 所有題目的 `instructions` + 各選項 `criteria` 說明加總。\n   - 後端推論引擎物理批次大小設定為 `-b 4096 -ub 4096`，單次推論之總 Prompt 絕對不得超過 4,096 Tokens。\n2. **伺服器「不會自動分塊」(No Server-Side Automatic Chunking)**：\n   - Clef 模型為單次前向傳播架構，伺服器**不會主動**將過大或超長之請求自動切塊處理。\n   - 若超出 4,096 Tokens 限制，底層推論引擎將直接報錯拒絕推論（HTTP 400/500 `input is too large to process`）。\n3. **客戶端分塊建議 (Client-Side Chunking)**：\n   - 若有大量題型、大量選項或長文本評估需求（Token 消耗會隨「題目數 × 選項數」倍數放大），呼叫端**必須於客戶端實作分塊 (Chunking)** 機制（例如按選項數切塊，每次呼叫 ≤ 10 個選項），連續發送後由客戶端自動聚合結果。",
+        "operationId": "post_systemone_v1_systemone_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SystemOneRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemOneResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "輸入格式或題型參數錯誤，或超出單次 Token 上限 (Bad Request)"
+          },
+          "422": {
+            "description": "請求欄位驗證失敗 (Unprocessable Entity)"
+          },
+          "500": {
+            "description": "推論伺服器內部錯誤 (Internal Error)"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ChoiceAnswer": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "choice",
+            "title": "Type",
+            "default": "choice"
+          },
+          "choice": {
+            "type": "string",
+            "title": "Choice",
+            "description": "模型選出的最高機率選項 ID"
+          },
+          "confidence": {
+            "type": "number",
+            "title": "Confidence",
+            "description": "該選項的預測信心度 (0.0 ~ 1.0)"
+          },
+          "probabilities": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Probabilities",
+            "description": "各選項的完整機率分佈"
+          }
+        },
+        "type": "object",
+        "required": [
+          "choice",
+          "confidence",
+          "probabilities"
+        ],
+        "title": "ChoiceAnswer"
+      },
+      "NoulAnswer": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "noul",
+            "title": "Type",
+            "default": "noul"
+          },
+          "noul": {
+            "type": "number",
+            "title": "Noul",
+            "description": "判定為 True 的機率值 (0.0 ~ 1.0)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "noul"
+        ],
+        "title": "NoulAnswer"
+      },
+      "QuestionDef": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "choice",
+              "noul",
+              "score"
+            ],
+            "title": "Type",
+            "description": "問題類型：\n- `choice`: 多選一類別\n- `noul`: 二分是非判斷 (回傳 True 的機率)\n- `score`: 有序等級評分 (由低至高)"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions",
+            "description": "問題說明或判定指示。若省略，則自動使用 question ID 作為預設指示。"
+          },
+          "criteria": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Criteria",
+            "description": "選項判定準則：\n- 若 type 為 `choice`，必須為字典：`{'選項ID': '判定標準說明'}`\n- 若 type 為 `score`，必須為有序列表：`['等級0說明', '等級1說明', ...]`\n- 若 type 為 `noul`，此欄位可省略\n\n⚠️ **Token 消耗提示**：每個選項的描述文字皆會計入單次請求 4,096 Tokens 的實體上限，請保持精簡明確，避免冗長無關內容。"
+          }
+        },
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "title": "QuestionDef"
+      },
+      "ScoreAnswer": {
+        "properties": {
+          "type": {
+            "type": "string",
+            "const": "score",
+            "title": "Type",
+            "default": "score"
+          },
+          "score": {
+            "type": "number",
+            "title": "Score",
+            "description": "加權期望評分（以索引 0 ~ N-1 加權計算）"
+          },
+          "confidence": {
+            "type": "number",
+            "title": "Confidence",
+            "description": "最高機率等級的信心度"
+          },
+          "legend": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Legend",
+            "description": "等級索引與文字對照表"
+          },
+          "probabilities": {
+            "additionalProperties": {
+              "type": "number"
+            },
+            "type": "object",
+            "title": "Probabilities",
+            "description": "各等級的機率分佈"
+          }
+        },
+        "type": "object",
+        "required": [
+          "score",
+          "confidence",
+          "legend",
+          "probabilities"
+        ],
+        "title": "ScoreAnswer"
+      },
+      "SystemOneRequest": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "title": "Model",
+            "description": "模型識別代碼，固定為 `clef-flash`",
+            "default": "clef-flash"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {}
+            ],
+            "title": "State",
+            "description": "待評估的情境、工單內容、客訴描述或結構化 JSON 資料。\n\n⚠️ **單次上限 4,096 Tokens 與無自動分塊**：\n- 本欄位與所有題目說明、選項 criteria 共同計入單次 **4,096 Tokens** 實體上限。\n- 伺服器端**不會自動進行分塊 (No Auto-Chunking)**。若文本過長，請先於客戶端進行摘要或切塊後再送出請求。"
+          },
+          "questions": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/QuestionDef"
+            },
+            "type": "object",
+            "title": "Questions",
+            "description": "題組字典，Key 為自訂題目代號（例如 'department', 'urgency'），Value 為題目結構定義。\n\n⚠️ **Token 放大效應與分塊建議**：\n- 單次請求消耗之 Token 數會隨「題目數 × 選項數」倍數放大，全請求上限為 **4,096 Tokens**。\n- 伺服器**不會**在超出上限時自動分割請求。\n- 若評估維度或題數較多（例如 > 10 個選項或多題複雜評估），呼叫端應於客戶端實裝自動分塊（如每批次 ≤ 10 個選項切塊連續呼叫後聚合）。"
+          }
+        },
+        "type": "object",
+        "required": [
+          "state",
+          "questions"
+        ],
+        "title": "SystemOneRequest",
+        "example": {
+          "model": "clef-flash",
+          "questions": {
+            "department": {
+              "criteria": {
+                "billing": "款項扣除、退款、對帳相關問題",
+                "customer_support": "一般諮詢或常見問題",
+                "tech": "伺服器超時、API 錯誤、系統故障"
+              },
+              "instructions": "判斷此工單應指派給哪個部門處理？",
+              "type": "choice"
+            },
+            "is_system_down": {
+              "instructions": "是否屬於核心服務中斷或重大故障？",
+              "type": "noul"
+            },
+            "urgency": {
+              "criteria": [
+                "可稍後處理",
+                "今日處理",
+                "即刻緊急處理 (P0)"
+              ],
+              "instructions": "判斷此事件處理緊急程度",
+              "type": "score"
+            }
+          },
+          "state": "使用者反映於結帳步驟出現 HTTP 504 Gateway Timeout，信用卡款項已扣款但系統未產生訂單。"
+        }
+      },
+      "SystemOneResponse": {
+        "properties": {
+          "model": {
+            "type": "string",
+            "title": "Model",
+            "description": "模型識別碼"
+          },
+          "answers": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ChoiceAnswer"
+                },
+                {
+                  "$ref": "#/components/schemas/NoulAnswer"
+                },
+                {
+                  "$ref": "#/components/schemas/ScoreAnswer"
+                },
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Answers",
+            "description": "各題目的決策結果，Key 與請求中的題目代號相對應"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/UsageInfo",
+            "description": "Token 統計資訊"
+          },
+          "latency_seconds": {
+            "type": "number",
+            "title": "Latency Seconds",
+            "description": "伺服器推論耗時（秒）"
+          }
+        },
+        "type": "object",
+        "required": [
+          "model",
+          "answers",
+          "usage",
+          "latency_seconds"
+        ],
+        "title": "SystemOneResponse"
+      },
+      "UsageInfo": {
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "title": "Input Tokens",
+            "description": "輸入消耗之 Token 數"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "title": "Output Tokens",
+            "description": "輸出 Token 數（Clef 為單次 Forward，固定為 0）",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "input_tokens"
+        ],
+        "title": "UsageInfo"
+      }
+    }
+  }
+}
