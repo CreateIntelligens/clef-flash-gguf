@@ -98,13 +98,22 @@ export function chunkQuestionsForClef(
 
 ## 🛠️ 4. 快速部署指南
 
-### 步驟 1：下載模型檔案
+### 步驟 1：一鍵全自動安裝與模型下載 (推薦)
 
-執行內建下載腳本（將自動抓取 Q4_K_M 模型與多模態投影矩陣）：
+專案內建一鍵全自動安裝程式（`install.sh` / `install.py`），會自動檢查磁碟空間、建立 Python 虛擬環境、安裝相依套件，並以**斷點續傳 + 即時進度條**自 Hugging Face 下載所有必要模型權重：
 
 ```bash
-bash scripts/download_models.sh
+# 一鍵全自動安裝（環境建立 + Hugging Face 模型下載校驗）
+./install.sh
+
+# 或使用純 Python 跨平台執行
+python3 install.py
 ```
+
+> [!TIP]
+> - 若已有 Python 虛擬環境，可加上 `--skip-venv` 僅下載模型：`./install.sh --skip-venv`
+> - 若欲校驗現有模型檔案是否完整無損：`./install.sh --check-only`
+> - 若有 Hugging Face API Token 可加速下載：`python3 install.py --hf-token <YOUR_HF_TOKEN>`
 
 ### 步驟 2：啟動推論引擎與 API 門面
 
@@ -236,6 +245,8 @@ curl -X POST https://clef.aiurl.tw/v1/systemone \
 clef-flash-gguf/
 ├── .gitignore                    # Git 忽略清單 (排他性過濾 GGUF 模型檔與 venv)
 ├── README.md                     # 專案總覽與使用說明
+├── install.sh                    # 一鍵自動安裝 Shell 指令檔 (環境建立 + 模型下載)
+├── install.py                    # 跨平台自動下載與完整性校驗 Python 程式
 ├── DEPLOYMENT_10.9.0.99.md       # 10.9.0.99 生產環境完整建置技術文件
 ├── GRAFANA_KNOWHOW.md            # Grafana 監控指標、Flux 語法與踩坑筆記
 ├── openapi.json                  # OpenAPI 3.1 規範綱要 (含 4096-token 限制說明)
@@ -250,7 +261,7 @@ clef-flash-gguf/
 ├── models/
 │   └── README.md                 # 模型存放目錄說明
 └── scripts/
-    ├── download_models.sh        # 自動下載 Q4_K_M 與 mmproj 權重
+    ├── download_models.sh        # 下載腳本 (純 Bash 版)
     ├── run_server.sh             # 虛擬環境啟動腳本
     ├── test_inference.py         # API 推論驗證腳本
     └── test_clef_cpu.py          # 底層 CPU 原生推論測試腳本
