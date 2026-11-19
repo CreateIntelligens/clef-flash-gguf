@@ -143,6 +143,20 @@ class ContractTests(unittest.TestCase):
     def test_influx_tag_escaping(self):
         self.assertEqual(api._escape_influx_tag('host=a, b c'), 'host_a__b_c')
 
+    def test_backend_and_internal_errors_do_not_expose_exception_details(self):
+        with patch.object(api, 'record_telemetry') as telemetry:
+            with TestClient(api.app) as client:
+                with patch.object(api.http_client, 'post', AsyncMock(side_effect=httpx.ConnectError('secret http://127.0.0.1:18080/internal'))):
+                    r503 = client.post('/v1/systemone', json=STRUCTURED)
+                with patch.object(api.http_client, 'post', AsyncMock(side_effect=RuntimeError('internal stack trace path /srv/secret'))):
+                    r500 = client.post('/v1/systemone', json=STRUCTURED)
+        self.assertEqual(r503.status_code, 503)
+        self.assertNotIn('127.0.0.1', r503.json()['detail'])
+        self.assertNotIn('secret', r503.json()['detail'])
+        self.assertEqual(r500.status_code, 500)
+        self.assertNotIn('/srv/secret', r500.json()['detail'])
+        self.assertEqual(telemetry.call_count, 2)
+
 
 if __name__ == '__main__':
     unittest.main()

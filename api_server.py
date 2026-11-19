@@ -430,9 +430,14 @@ async def post_systemone(payload: SystemOneRequest, background_tasks: Background
             score_count=score_count,
             error_type="BackendUnreachable"
         )
+        detail = (
+            "GGUF 後端服務請求逾時，請稍後重試"
+            if isinstance(re, httpx.TimeoutException)
+            else "GGUF 後端服務連線失敗，請稍後重試"
+        )
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"detail": f"GGUF 後端服務連線失敗: {str(re)}"},
+            content={"detail": detail},
             background=background_tasks,
         )
     except Exception as e:
@@ -450,7 +455,7 @@ async def post_systemone(payload: SystemOneRequest, background_tasks: Background
         )
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": f"推論執行異常: {str(e)}"},
+            content={"detail": "推論執行發生內部錯誤，請稍後重試"},
             background=background_tasks,
         )
     finally:
