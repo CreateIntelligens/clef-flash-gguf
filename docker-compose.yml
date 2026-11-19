@@ -1,10 +1,5 @@
-version: '3.8'
-
 services:
-  # ============================================================================
-  # 1. llama.cpp Server (Clef-Flash GGUF 推論核心)
-  # ============================================================================
-  llama-server:
+  clef-flash-gguf-server:
     image: ghcr.io/ggml-org/llama.cpp:server
     container_name: clef-flash-gguf-server
     restart: unless-stopped
@@ -28,23 +23,6 @@ services:
       - -ub
       - "4096"
       - -t
-      - "16"
+      - "8"
       - -np
       - "2"
-
-  # ============================================================================
-  # 2. FastAPI Facade (OpenAPI / Swagger / 遙測指標推送)
-  # ============================================================================
-  api-facade:
-    build: .
-    container_name: clef-flash-api
-    restart: unless-stopped
-    depends_on:
-      - llama-server
-    ports:
-      - "0.0.0.0:8099:8099"
-    environment:
-      - BACKEND_URL=http://llama-server:8080
-      - HOST_NAME=10.9.0.99
-      - INFLUX_URL=http://10.9.0.9:8008/api/v2/write?org=main&bucket=telegraf&precision=s
-      - INFLUX_TOKEN=7f291e7ddcfa80d05deb46d3eb6137b54553e72241378f3c

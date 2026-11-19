@@ -1,33 +1,79 @@
+import asyncio
 import os
 import sys
 import time
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, HTTPException, Request, status, BackgroundTasks
-from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import JSONResponse, RedirectResponse
+from pydantic import BaseModel, ConfigDict, Field
 import uvicorn
 
 BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:18080")
-INFLUX_URL = os.getenv("INFLUX_URL", "http://10.9.0.9:8008/api/v2/write?org=main&bucket=telegraf&precision=s")
-INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "7f291e7ddcfa80d05deb46d3eb6137b54553e72241378f3c")
-HOST_NAME = os.getenv("HOST_NAME", "10.9.0.99")
+INFLUX_URL = os.getenv("INFLUX_URL", "http://127.0.0.1:8086/api/v2/write?org=main&bucket=telegraf&precision=s")
+INFLUX_TOKEN = os.getenv("INFLUX_TOKEN", "")
+HOST_NAME = os.getenv("HOST_NAME", "clef-secondary")
+MAX_CONCURRENT_INFERENCE = max(1, int(os.getenv("MAX_CONCURRENT_INFERENCE", "8")))
+INFERENCE_QUEUE_TIMEOUT = max(0.1, float(os.getenv("INFERENCE_QUEUE_TIMEOUT", "10.0")))
+BACKEND_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BACKEND_TIMEOUT_SECONDS", "180.0")))
+FlexibleValue = Union[str, Dict[str, Any], List[Any]]
+StateValue = Union[str, Dict[str, Any], List[Any], None]
 
 http_client: Optional[httpx.AsyncClient] = None
+health_client: Optional[httpx.AsyncClient] = None
+# 全域 Telemetry Client，避免每次都重建
+telemetry_client: Optional[httpx.AsyncClient] = None
+inference_semaphore: Optional[asyncio.Semaphore] = None
+
+
+def _escape_influx_tag(value: str, max_len: int = 64) -> str:
+    """Normalize tag values for InfluxDB line protocol safety."""
+    return (
+        value.replace("\\", "_")
+        .replace(" ", "_")
+        .replace(",", "_")
+        .replace("=", "_")
+        .replace("\n", "_")[:max_len]
+    )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global http_client
+    global http_client, health_client, telemetry_client, inference_semaphore
+
+    inference_limits = httpx.Limits(max_keepalive_connections=16, max_connections=32)
     http_client = httpx.AsyncClient(
         base_url=BACKEND_URL,
-        timeout=httpx.Timeout(180.0, connect=5.0)
+        timeout=httpx.Timeout(BACKEND_TIMEOUT_SECONDS, connect=5.0, pool=5.0),
+        limits=inference_limits,
     )
-    yield
-    if http_client:
-        await http_client.aclose()
 
-def record_telemetry(
+    health_client = httpx.AsyncClient(
+        base_url=BACKEND_URL,
+        timeout=httpx.Timeout(2.0, connect=1.0),
+        limits=httpx.Limits(max_keepalive_connections=2, max_connections=5),
+    )
+
+    telemetry_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(1.5, connect=1.0),
+        limits=httpx.Limits(max_keepalive_connections=5, max_connections=20),
+    )
+    inference_semaphore = asyncio.Semaphore(MAX_CONCURRENT_INFERENCE)
+
+    try:
+        yield
+    finally:
+        for client in (http_client, health_client, telemetry_client):
+            if client:
+                await client.aclose()
+        http_client = None
+        health_client = None
+        telemetry_client = None
+        inference_semaphore = None
+
+
+async def record_telemetry(
     status_code: int,
     latency: float,
     input_tokens: int = 0,
@@ -37,12 +83,15 @@ def record_telemetry(
     score_count: int = 0,
     error_type: Optional[str] = None
 ):
-    """背景線程推送指標至 10.9.0.9 InfluxDB，不阻塞 API 回應。"""
+    """非同步推送推論指標至 InfluxDB，避免創建過多同步連線。"""
+    if not INFLUX_TOKEN or not telemetry_client:
+        return
     try:
         status_type = "success" if status_code < 400 else ("client_error" if status_code < 500 else "server_error")
-        tags = f"host={HOST_NAME},model=clef-flash,status={status_code},status_type={status_type}"
+        safe_host = _escape_influx_tag(HOST_NAME)
+        tags = f"host={safe_host},model=clef-flash,status={status_code},status_type={status_type}"
         if error_type:
-            safe_err = error_type.replace(" ", "_").replace(",", "_")[:32]
+            safe_err = _escape_influx_tag(error_type, max_len=32)
             tags += f",error_type={safe_err}"
         fields = (
             f"latency_seconds={latency},"
@@ -53,68 +102,41 @@ def record_telemetry(
             f"score_count={score_count}i"
         )
         line = f"clef_inference,{tags} {fields}"
-        with httpx.Client(timeout=2.0) as client:
-            client.post(
-                INFLUX_URL,
-                headers={
-                    "Authorization": f"Token {INFLUX_TOKEN}",
-                    "Content-Type": "text/plain; charset=utf-8"
-                },
-                content=line.encode("utf-8")
-            )
+        await telemetry_client.post(
+            INFLUX_URL,
+            headers={
+                "Authorization": f"Token {INFLUX_TOKEN}",
+                "Content-Type": "text/plain; charset=utf-8"
+            },
+            content=line.encode("utf-8")
+        )
     except Exception as e:
         print(f"Telemetry error: {e}", file=sys.stderr)
 
 description = """
-# Cloudflare Clef-Flash 決策模型 API (SystemOne 相容規格 - GGUF 加速版)
+# Clef-Flash 決策 API（System One 相容）
 
-Clef-Flash 是 Cloudflare 基於 Qwen3.5-9B 開發的多模態「決策專用模型」。
-與傳統 LLM 逐字輸出（Autoregressive）不同，Clef-Flash 透過 Joint Schema Head 在**單次 Forward Pass** 中直接對所有問題選項計算機率分佈，無須解析文字或處理格式幻覺。
+由 Q4_K_M GGUF 與 llama.cpp 執行決策推論，支援 choice、noul、score。
 
-本服務已升級採用 **Q4_K_M GGUF 量化模型 + llama.cpp 核心引擎**，推論延遲顯著優化降低（降低約 80%~90%），同時保持極高準確度。
+- instructions 接受字串、JSON 物件或陣列；省略或 null 時以題目 ID 作為指示。
+- choice criteria 接受 1–255 個選項，其描述可以是文字、物件、陣列或 null。
+- noul criteria 可提供 true/false 的文字、物件或陣列描述。
+- score criteria 接受 2–10 個由低至高的文字、物件或陣列等級；legend 保留原始描述。
+- state 接受字串、JSON 物件、陣列或 null；images 可使用圖片 data URLs。
 
----
+完整渲染 prompt 上限為 4096 tokens，包括 state、所有題目指示、criteria、
+模型模板與圖片 token。context size 16384 與單次推論 batch 4096 是不同設定。
+服務採單次聯合推論，呼叫端可依需求拆分獨立題組，各批保留必要情境。
+Choice 需保留完整候選集合，分開候選後的機率分佈需另行設計比較策略。
+超限回報由推論後端決定；選項數或字元數只能作為容量估計。
 
-## 📌 支援的三種題目類型 (Question Types)
-
-1. **`choice`（多選一分類）**：
-   - 用於單選分類任務（如部門派工、工單分類、事件類型判定）。
-   - **必填 `criteria`**：格式為字典 `{"選項ID": "選項描述"}`。
-   - 回傳：選出的 `choice`、信心度 `confidence` 以及所有選項的 `probabilities` 機率分佈。
-
-2. **`noul`（二分判斷 / 是非題）**：
-   - 用於是非、布林、是否核准判定（True / False）。
-   - 可選填 `criteria`（預設會以 `true`/`false` 判斷）。
-   - 回傳：`noul`（代表判定為 `true` 的機率值，介於 0.0 ~ 1.0）。
-
-3. **`score`（等級評定 / 有序評分）**：
-   - 用於有先後順序的等級、優先級、緊急度評等（如優先級 P0~P3、滿意度 1~5 星）。
-   - **必填 `criteria`**：格式為有序字串列表，索引由低至高排列，如 `["低", "中", "高", "緊急"]`。
-   - 回傳：加權期望分數 `score`、最高機率等級 `confidence` 與各等級機率 `probabilities`。
-
----
-
-## ⚠️ 實體 Token 限制與分塊機制規範 (Important Limits & Chunking)
-
-- **單次請求實體上限 (Physical Token Limit)**：**4,096 Tokens**。
-  - 後端推論引擎實體批次大小設定為 `-b 4096 -ub 4096`。
-- **伺服器「不會自動分塊」(No Server-Side Auto-Chunking)**：
-  - Clef-Flash 模型架構採用單次前向傳播 (Single Forward Pass) 同步計算所有選項的聯合分佈 (Joint Schema)，伺服器**不會**替客戶端自動切塊。
-  - 單次請求總 Token 數（由 `state` 情境描述 + 所有題目 `instructions` + 各選項 `criteria` 說明加總）若超過 **4,096 Tokens**，底層推論引擎將直接拒絕處理並觸發報錯（HTTP 400/500 `input is too large to process`）。
-- **客戶端分塊建議 (Client Chunking Practice)**：
-  - 若題組龐大、選項眾多（Token 消耗會隨「題目數 × 選項數」倍數放大）或情境文本極長，呼叫端**必須在客戶端實作分塊 (Chunking)** 機制（例如：限制單次請求 ≤ 10 個選項，或按業務維度切分為多次請求發送），並在客戶端聚合結果。
-
----
-
-## 💡 輸入資料格式 (State)
-`state` 欄位可傳入任何情境描述，支援：
-- 純文字字串（客戶訊息、日誌內容、事件通報）
-- JSON 字典物件（結構化資料，模型會自動序列化讀取）
+confidence 描述機率分佈集中程度，應依任務資料校準門檻。
+串流輸出需另行驗證；此端點提供完整 JSON 回應。
 """
 
 app = FastAPI(
     title="Cloudflare Clef-Flash Decision API",
-    version="1.1.0",
+    version="1.2.0",
     description=description,
     docs_url="/docs",
     redoc_url="/redoc",
@@ -123,79 +145,93 @@ app = FastAPI(
 
 # ----------------- Pydantic Schema 定義 -----------------
 
-class QuestionDef(BaseModel):
-    type: Literal["choice", "noul", "score"] = Field(
-        ...,
-        description="問題類型：\n- `choice`: 多選一類別\n- `noul`: 二分是非判斷 (回傳 True 的機率)\n- `score`: 有序等級評分 (由低至高)"
+class PublicModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+class NoulQuestion(PublicModel):
+    type: Literal["noul"] = "noul"
+    instructions: FlexibleValue | None = Field(
+        default=None, description="Yes/no question. If omitted, the question ID is used."
     )
-    instructions: Optional[str] = Field(
-        None,
-        description="問題說明或判定指示。若省略，則自動使用 question ID 作為預設指示。"
-    )
-    criteria: Optional[Union[Dict[str, str], List[str]]] = Field(
-        None,
-        description=(
-            "選項判定準則：\n"
-            "- 若 type 為 `choice`，必須為字典：`{'選項ID': '判定標準說明'}`\n"
-            "- 若 type 為 `score`，必須為有序列表：`['等級0說明', '等級1說明', ...]`\n"
-            "- 若 type 為 `noul`，此欄位可省略\n\n"
-            "⚠️ **Token 消耗提示**：每個選項的描述文字皆會計入單次請求 4,096 Tokens 的實體上限，請保持精簡明確，避免冗長無關內容。"
-        )
+    criteria: dict[str, FlexibleValue] | None = Field(
+        default=None, description="Optional descriptions for true and false."
     )
 
-class SystemOneRequest(BaseModel):
-    model: str = Field(
+class ChoiceQuestion(PublicModel):
+    type: Literal["choice"] = "choice"
+    instructions: FlexibleValue | None = None
+    criteria: dict[str, Any] = Field(
+        min_length=1,
+        max_length=255,
+        description="Map of option IDs to descriptions; use null when no description is needed.",
+    )
+
+class ScoreQuestion(PublicModel):
+    type: Literal["score"] = "score"
+    instructions: FlexibleValue | None = None
+    criteria: list[FlexibleValue] = Field(
+        min_length=2,
+        max_length=10,
+        description="Ordered score levels from lowest to highest.",
+    )
+
+Question = Annotated[Union[NoulQuestion, ChoiceQuestion, ScoreQuestion], Field(discriminator="type")]
+
+class SystemOneRequest(PublicModel):
+    model: Literal["clef-flash"] = Field(
         default="clef-flash",
-        description="模型識別代碼，固定為 `clef-flash`"
+        description="Model identifier. The service has Clef-Flash loaded.",
     )
-    state: Union[str, Dict[str, Any], Any] = Field(
-        ...,
-        description=(
-            "待評估的情境、工單內容、客訴描述或結構化 JSON 資料。\n\n"
-            "⚠️ **單次上限 4,096 Tokens 與無自動分塊**：\n"
-            "- 本欄位與所有題目說明、選項 criteria 共同計入單次 **4,096 Tokens** 實體上限。\n"
-            "- 伺服器端**不會自動進行分塊 (No Auto-Chunking)**。若文本過長，請先於客戶端進行摘要或切塊後再送出請求。"
-        )
+    state: StateValue = Field(
+        description="State to evaluate: string, object, array, or null."
     )
-    questions: Dict[str, QuestionDef] = Field(
-        ...,
+    questions: dict[str, Question] = Field(
+        min_length=1,
         description=(
-            "題組字典，Key 為自訂題目代號（例如 'department', 'urgency'），Value 為題目結構定義。\n\n"
-            "⚠️ **Token 放大效應與分塊建議**：\n"
-            "- 單次請求消耗之 Token 數會隨「題目數 × 選項數」倍數放大，全請求上限為 **4,096 Tokens**。\n"
-            "- 伺服器**不會**在超出上限時自動分割請求。\n"
-            "- 若評估維度或題數較多（例如 > 10 個選項或多題複雜評估），呼叫端應於客戶端實裝自動分塊（如每批次 ≤ 10 個選項切塊連續呼叫後聚合）。"
-        )
+            "Questions keyed by caller-chosen IDs. Supports noul, choice, and score. "
+            "Clef evaluates all questions jointly in one physical batch; the combined "
+            "rendered request must stay within the 4096-token limit. The API does not "
+            "split questions automatically."
+        ),
+    )
+    images: list[str] | None = Field(
+        default=None,
+        description="Optional image data URLs, for example data:image/jpeg;base64,...",
     )
 
-    model_config = {
-        "json_schema_extra": {
-            "example": {
-                "model": "clef-flash",
-                "state": "使用者反映於結帳步驟出現 HTTP 504 Gateway Timeout，信用卡款項已扣款但系統未產生訂單。",
-                "questions": {
-                    "department": {
-                        "type": "choice",
-                        "instructions": "判斷此工單應指派給哪個部門處理？",
-                        "criteria": {
-                            "billing": "款項扣除、退款、對帳相關問題",
-                            "tech": "伺服器超時、API 錯誤、系統故障",
-                            "customer_support": "一般諮詢或常見問題"
+    model_config = ConfigDict(
+        extra="allow",
+        json_schema_extra={
+            "examples": [
+                {
+                    "model": "clef-flash",
+                    "state": {
+                        "invoice": {
+                            "vendor": "Acme",
+                            "total": 1250.0,
+                            "currency": "USD",
+                            "status": "overdue",
                         }
                     },
-                    "urgency": {
-                        "type": "score",
-                        "instructions": "判斷此事件處理緊急程度",
-                        "criteria": ["可稍後處理", "今日處理", "即刻緊急處理 (P0)"]
+                    "questions": {
+                        "status": {
+                            "type": "choice",
+                            "instructions": "What is the invoice status?",
+                            "criteria": {
+                                "paid": "Invoice is paid.",
+                                "overdue": "Invoice is past due.",
+                                "draft": "Invoice was not sent.",
+                            },
+                        },
+                        "large": {
+                            "type": "noul",
+                            "instructions": "Is the total above 1000 USD?",
+                        },
                     },
-                    "is_system_down": {
-                        "type": "noul",
-                        "instructions": "是否屬於核心服務中斷或重大故障？"
-                    }
                 }
-            }
-        }
-    }
+            ]
+        },
+    )
 
 class ChoiceAnswer(BaseModel):
     type: Literal["choice"] = "choice"
@@ -210,8 +246,8 @@ class NoulAnswer(BaseModel):
 class ScoreAnswer(BaseModel):
     type: Literal["score"] = "score"
     score: float = Field(..., description="加權期望評分（以索引 0 ~ N-1 加權計算）")
-    confidence: float = Field(..., description="最高機率等級的信心度")
-    legend: Dict[str, str] = Field(..., description="等級索引與文字對照表")
+    confidence: float = Field(..., description="機率分佈集中程度，介於 0.0 與 1.0；與最高機率值分開解讀。")
+    legend: Dict[str, FlexibleValue] = Field(..., description="等級索引與文字對照表")
     probabilities: Dict[str, float] = Field(..., description="各等級的機率分佈")
 
 class UsageInfo(BaseModel):
@@ -236,9 +272,11 @@ def root():
 @app.get('/health', summary="健康檢查端點", tags=["監控與健康狀態"])
 async def health():
     backend_status = "unreachable"
-    if http_client:
+    probe_client = health_client or http_client
+    if probe_client:
         try:
-            r = await http_client.get("/health")
+            # 使用獨立的短 timeout 與獨立連線池，避免被推論請求塞爆連線池
+            r = await probe_client.get("/health", timeout=2.0)
             if r.status_code == 200:
                 backend_status = "healthy"
         except Exception:
@@ -252,26 +290,19 @@ async def health():
         'dtype': 'Q4_K_M (4-bit GGUF)',
         'model': 'bartowski/Cloudflare_clef-flash-GGUF',
         'api_format': 'SystemOne / Jev Compatible',
-        'telemetry_target': '10.9.0.9:8008 (InfluxDB telegraf)'
+        'telemetry_target': 'InfluxDB Telegraf (configured server-side)'
     }
 
 @app.post(
     '/v1/systemone',
     response_model=SystemOneResponse,
     summary="Clef-Flash 決策推論核心端點 (單次上限 4,096 Tokens，不自動分塊)",
-    description="""
-接收情境描述 (`state`) 與題組定義 (`questions`)，執行單次 Forward Pass 決策並回傳所有題目的機率分佈與結果。
-
-### ⚠️ 重要限制與整合規範 (Important Constraints & Best Practices)：
-1. **單次請求實體上限 4,096 Tokens**：
-   - 總 Token 計算方式為：`state` 文本 + 所有題目的 `instructions` + 各選項 `criteria` 說明加總。
-   - 後端推論引擎物理批次大小設定為 `-b 4096 -ub 4096`，單次推論之總 Prompt 絕對不得超過 4,096 Tokens。
-2. **伺服器「不會自動分塊」(No Server-Side Automatic Chunking)**：
-   - Clef 模型為單次前向傳播架構，伺服器**不會主動**將過大或超長之請求自動切塊處理。
-   - 若超出 4,096 Tokens 限制，底層推論引擎將直接報錯拒絕推論（HTTP 400/500 `input is too large to process`）。
-3. **客戶端分塊建議 (Client-Side Chunking)**：
-   - 若有大量題型、大量選項或長文本評估需求（Token 消耗會隨「題目數 × 選項數」倍數放大），呼叫端**必須於客戶端實作分塊 (Chunking)** 機制（例如按選項數切塊，每次呼叫 ≤ 10 個選項），連續發送後由客戶端自動聚合結果。
-""",
+    description=(
+        "依 state 與 typed questions 執行聯合決策推論。instructions 與 criteria "
+        "支援結構化 JSON；Score legend 保留等級描述的原始型別。images 使用 data URLs。"
+        "完整 prompt（含模板與圖片 token）需在 4096-token 單次 batch 內；"
+        "呼叫端可拆分獨立題組並保留每題所需情境與完整 Choice 候選集合。"
+    ),
     tags=["決策推論 (Decision Inference)"],
     status_code=status.HTTP_200_OK,
     responses={
@@ -283,7 +314,7 @@ async def health():
 async def post_systemone(payload: SystemOneRequest, background_tasks: BackgroundTasks):
     """
     接收情境描述 (`state`) 與題組定義 (`questions`)，執行單次 Forward Pass 決策並回傳所有題目的機率分佈與結果。
-    
+
     支援題型：
     - `choice`：多分類
     - `noul`：二分是非題
@@ -298,24 +329,61 @@ async def post_systemone(payload: SystemOneRequest, background_tasks: Background
     if questions_count == 0:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="At least one question is required")
 
-    req_dict = payload.model_dump(exclude_none=True)
+    req_dict = payload.model_dump(exclude_unset=True)
+    req_dict["model"] = payload.model
     # 補齊 instructions（若使用者未設定，自動回退為題號 ID）
     for q_id, q_data in req_dict.get("questions", {}).items():
-        if not q_data.get("instructions"):
+        if q_data.get("instructions") is None:
             q_data["instructions"] = str(q_id)
 
+    acquired = False
     try:
         if not http_client:
             raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="後端連線客戶端尚未就緒")
+
+        if inference_semaphore is not None:
+            try:
+                await asyncio.wait_for(inference_semaphore.acquire(), timeout=INFERENCE_QUEUE_TIMEOUT)
+                acquired = True
+            except asyncio.TimeoutError:
+                latency = round(time.time() - t_start, 3)
+                print(
+                    f"Inference queue full after {latency}s (max_concurrent={MAX_CONCURRENT_INFERENCE})",
+                    file=sys.stderr,
+                )
+                background_tasks.add_task(
+                    record_telemetry,
+                    status_code=503,
+                    latency=latency,
+                    questions_count=questions_count,
+                    choice_count=choice_count,
+                    noul_count=noul_count,
+                    score_count=score_count,
+                    error_type="InferenceQueueFull"
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={"detail": "推論佇列已滿，請稍後重試或切換備援節點"},
+                    headers={"Retry-After": "5"},
+                    background=background_tasks,
+                )
 
         resp = await http_client.post("/v1/systemone", json=req_dict)
         latency = round(time.time() - t_start, 3)
 
         if resp.status_code != 200:
             err_text = resp.text
+            error_status = resp.status_code
+            # Physical batch overflow is an input/capacity issue, not an outage.
+            if resp.status_code >= 500 and "is too large to process" in err_text and "physical batch size" in err_text:
+                error_status = 400
+            print(
+                f"Backend HTTP {resp.status_code} -> {error_status} in {latency}s: {err_text[:300]}",
+                file=sys.stderr,
+            )
             background_tasks.add_task(
                 record_telemetry,
-                status_code=resp.status_code,
+                status_code=error_status,
                 latency=latency,
                 questions_count=questions_count,
                 choice_count=choice_count,
@@ -323,7 +391,11 @@ async def post_systemone(payload: SystemOneRequest, background_tasks: Background
                 score_count=score_count,
                 error_type=f"BackendHTTP_{resp.status_code}"
             )
-            raise HTTPException(status_code=resp.status_code, detail=f"推論引擎回應異常: {err_text}")
+            return JSONResponse(
+                status_code=error_status,
+                content={"detail": f"推論引擎回應異常: {err_text}"},
+                background=background_tasks,
+            )
 
         result = resp.json()
         result["model"] = "clef-flash-q4_k_m"
@@ -347,6 +419,7 @@ async def post_systemone(payload: SystemOneRequest, background_tasks: Background
         raise
     except httpx.RequestError as re:
         latency = round(time.time() - t_start, 3)
+        print(f"Backend request error in {latency}s: {type(re).__name__}: {re}", file=sys.stderr)
         background_tasks.add_task(
             record_telemetry,
             status_code=503,
@@ -357,9 +430,14 @@ async def post_systemone(payload: SystemOneRequest, background_tasks: Background
             score_count=score_count,
             error_type="BackendUnreachable"
         )
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"GGUF 後端服務連線失敗: {str(re)}")
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"detail": f"GGUF 後端服務連線失敗: {str(re)}"},
+            background=background_tasks,
+        )
     except Exception as e:
         latency = round(time.time() - t_start, 3)
+        print(f"Unexpected inference error in {latency}s: {type(e).__name__}: {e}", file=sys.stderr)
         background_tasks.add_task(
             record_telemetry,
             status_code=500,
@@ -370,7 +448,14 @@ async def post_systemone(payload: SystemOneRequest, background_tasks: Background
             score_count=score_count,
             error_type=type(e).__name__
         )
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"推論執行異常: {str(e)}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": f"推論執行異常: {str(e)}"},
+            background=background_tasks,
+        )
+    finally:
+        if acquired and inference_semaphore is not None:
+            inference_semaphore.release()
 
 if __name__ == '__main__':
-    uvicorn.run(app, host='0.0.0.0', port=8099)
+    uvicorn.run(app, host='0.0.0.0', port=8099, timeout_graceful_shutdown=10)
