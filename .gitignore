@@ -53,3 +53,12 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Local staging, backups & deployment overrides
+backups/
+compat-staging-*/
+*.orig
+*.bak*
+.env.*
+!.env.example
+test_clef_cpu.py
